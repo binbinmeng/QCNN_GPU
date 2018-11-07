@@ -1,38 +1,35 @@
 #include "qvrcnn.cuh"
+#include <stdio.h>
 
-qvrcnn::qvrcnn(cudnnHandle_t cudnnHandle, cudnnTensorDescriptor_t xDesc, int batch, int channel, int inheight, int inwidth)//build qvrcnn
+qvrcnn::qvrcnn(int gpu_num, int batch, int channel, int height, int width)//build qvrcnn
 {
-	height = inheight, width = inwidth;
-	C1.build(cudnnHandle, xDesc, channel, 64, height, width, 5);
-	C2_1.build(cudnnHandle, C1.yDesc, 64, 32, height, width, 3);
-	C2_2.build(cudnnHandle, C1.yDesc, 64, 16, height, width, 5);
-	setConcat(conc1_Desc, conc1, 48);
-	C3_1.build(cudnnHandle, conc1_Desc, 48, 16, height, width, 3);
-	C3_2.build(cudnnHandle, conc1_Desc, 48, 32, height, width, 1);
-	setConcat(conc2_Desc, conc2, 48);
-	C4.build(cudnnHandle, conc2_Desc, 48, 1, height, width, 5);
-	workspaceSize = GRIDSIZE * sizeof(cudnnType);
-	workspaceSize = (workspaceSize > C1.buffer_size()) ? workspaceSize : C1.buffer_size();
-	workspaceSize = (workspaceSize > C2_1.buffer_size()) ? workspaceSize : C2_1.buffer_size();
-	workspaceSize = (workspaceSize > C2_2.buffer_size()) ? workspaceSize : C2_2.buffer_size();
-	workspaceSize = (workspaceSize > C3_1.buffer_size()) ? workspaceSize : C3_1.buffer_size();
-	workspaceSize = (workspaceSize > C3_2.buffer_size()) ? workspaceSize : C3_2.buffer_size();
-	workspaceSize = (workspaceSize > C4.buffer_size()) ? workspaceSize : C4.buffer_size();
+	check(cudaSetDevice(gpu_num));
+	check(cudnnCreate(&cudnnHandle));
+	this->batch = batch, this->channel = channel, this->height = height, this->width = width;
+	
+	I1.build(batch, channel, height, width);
+	C1.build(cudnnHandle, I1.xDesc, batch, height, width, I1.outChannel, 64, 5);
+	C2_1.build(cudnnHandle, C1.vDesc, batch, height, width, 64, 32, 3);
+	C2_2.build(cudnnHandle, C1.vDesc, batch, height, width, 64, 16, 5);
+	Conc1.build(batch, height, width, 32, 16);
+	C3_1.build(cudnnHandle, Conc1.concDesc, batch, height, width, 48, 16, 3);
+	C3_2.build(cudnnHandle, Conc1.concDesc, batch, height, width, 48, 32, 1);
+	Conc2.build(batch, height, width, 16, 32);
+	C4.build(cudnnHandle, Conc2.concDesc, batch, height, width, 48, 1, 5);
+
+	workspaceSize = GRIDSIZE * sizeof(convtype);
+	workspaceSize = (workspaceSize > C1.workspaceSize) ? workspaceSize : C1.workspaceSize;
+	workspaceSize = (workspaceSize > C2_1.workspaceSize) ? workspaceSize : C2_1.workspaceSize;
+	workspaceSize = (workspaceSize > C2_2.workspaceSize) ? workspaceSize : C2_2.workspaceSize;
+	workspaceSize = (workspaceSize > C3_1.workspaceSize) ? workspaceSize : C3_1.workspaceSize;
+	workspaceSize = (workspaceSize > C3_2.workspaceSize) ? workspaceSize : C3_2.workspaceSize;
+	workspaceSize = (workspaceSize > C4.workspaceSize) ? workspaceSize : C4.workspaceSize;
 	cudaMalloc(&workspace, workspaceSize);
 }
-int qvrcnn::setConcat(cudnnTensorDescriptor_t conc_Desc, void *conc, int channel)
-{
-	cudnnCreateTensorDescriptor(&conc_Desc);
-	check(cudnnSetTensor4dDescriptor(conc_Desc,
-		CUDNN_TENSOR_NCHW,
-		CUDNNTYPE,
-		1, channel, height, width));
-	check(cudaMalloc(&conc, sizeof(cudnnType)*channel*height*width));
-}
-int qvrcnn::load(const char *filename)
+int qvrcnn::load_para(char *filename)
 {
 	FILE *fp;
-	if (fopen_s(&fp, filename, "rb") == NULL)
+	if (fopen_s(&fp, filename, "rb"))
 	{
 		printf("cannot open data file.\n");
 		exit(1);
@@ -46,82 +43,70 @@ int qvrcnn::load(const char *filename)
 	fclose(fp);
 	return 0;
 }
-int qvrcnn::forward(cudnnHandle_t cudnnHandle, cudnnTensorDescriptor_t xDesc, void *x)
+int qvrcnn::load_data(datatype *input)
 {
-	int layer;
+	I1.load(input);
+	return 0;
+}
+int qvrcnn::forward(void)
+{
+	int layer=0;
+
+	//input layer
+	I1.ppro();
 
 	//layer 1
 	layer = 1;
-	insert_w(C1.step_w, layer);
-	adjustBasic<<<1,64>>>(steps, (cudnnType*)C1.b, (cudnnType*)C1.b, layer);
-	C1.ConvForward(cudnnHandle, xDesc, x, workspace, workspaceSize);
+	adjustBasic<<<1,64>>>(steps, (btype*)C1.b, (btype*)C1.b_adj, layer-1);
+	C1.ConvForward(cudnnHandle, I1.xDesc, I1.x_ppro, workspace, workspaceSize);
+	C1.activate(cudnnHandle);
 	C1.quantize_out(workspace);
+	//C1.viewmem((xwtype*)I1.x_ppro);
+	insert_w(C1.step_w, layer);
 	insert_y(C1.step_y, layer);
 
 	//layer 2
 	layer = 2;
+	adjustBasic <<<1, 32>>>(steps, (btype*)C2_1.b, (btype*)C2_1.b_adj, layer-1);
+	//C2_1.viewmem();
+	adjustBasic <<<1, 16>>>(steps, (btype*)C2_2.b, (btype*)C2_2.b_adj, layer-1);
+	C2_1.ConvForward(cudnnHandle, C1.vDesc, C1.v, workspace, workspaceSize);
+	C2_1.activate(cudnnHandle);
+	//C2_1.viewmem();
+	C2_2.ConvForward(cudnnHandle, C1.vDesc, C1.v, workspace, workspaceSize);
+	C2_2.activate(cudnnHandle);
+	//C2_2.viewmem();
+	Conc1.concat(&C2_1, &C2_2, workspace);
 	insert_w(C2_1.step_w, layer);
-	adjustBasic << <1, 32 >> >(steps, (cudnnType*)C2_1.b, (cudnnType*)C2_1.b, layer);
-	adjustBasic << <1, 32 >> >(steps, (cudnnType*)C2_2.b, (cudnnType*)C2_2.b, layer);
-	C2_1.ConvForward(cudnnHandle, C1.yDesc, C1.y, workspace, workspaceSize);
-	C2_2.ConvForward(cudnnHandle, C1.yDesc, C1.y, workspace, workspaceSize);
-	concat(C2_1, C2_2, conc1);
 	insert_y(C2_1.step_y, layer);
 
 	//layer 3
 	layer = 3;
+	adjustBasic <<<1, 16>>>(steps, (btype*)C3_1.b, (btype*)C3_1.b_adj, layer-1);
+	adjustBasic <<<1, 32>>>(steps, (btype*)C3_2.b, (btype*)C3_2.b_adj, layer-1);
+	C3_1.ConvForward(cudnnHandle, Conc1.concDesc, Conc1.conc, workspace, workspaceSize);
+	C3_1.activate(cudnnHandle);
+	//C3_1.viewmem();
+	C3_2.ConvForward(cudnnHandle, Conc1.concDesc, Conc1.conc, workspace, workspaceSize);
+	C3_2.activate(cudnnHandle);
+	//C3_2.viewmem();
+	Conc2.concat(&C3_1, &C3_2, workspace);
 	insert_w(C3_1.step_w, layer);
-	adjustBasic << <1, 32 >> >(steps, (cudnnType*)C3_1.b, (cudnnType*)C3_1.b, layer);
-	adjustBasic << <1, 32 >> >(steps, (cudnnType*)C3_2.b, (cudnnType*)C3_2.b, layer);
-	C3_1.ConvForward(cudnnHandle, conc1_Desc, conc1, workspace, workspaceSize);
-	C3_2.ConvForward(cudnnHandle, conc1_Desc, conc1, workspace, workspaceSize);
-	concat(C3_1, C3_2, conc2);
 	insert_y(C3_1.step_y, layer);
 
 	//layer 4
 	layer = 4;
+	adjustBasic << <1, 1 >> >(steps, (btype*)C4.b, (btype*)C4.b_adj, layer-1);
+	C4.ConvForward(cudnnHandle, Conc2.concDesc, Conc2.conc, workspace, workspaceSize);
+	//C4.viewmem();
 	insert_w(C4.step_w, layer);
-	adjustBasic << <1, 64 >> >(steps, (cudnnType*)C4.b, (cudnnType*)C4.b, layer);
-	C4.ConvForward(cudnnHandle, conc2_Desc, conc2, workspace, workspaceSize);
 	
 	//restore
-	adjustOutput<<<GRIDSIZE,BLOCKSIZE>>>(steps, (cudnnType*)C4.u, (cudnnType*)C4.y, layer);//scale n times
-	return 0;
-}
-int qvrcnn::concat(CovLayer C1, CovLayer C2, void *p)
-{
-	int i, j, k;
-	cudnnType max1, max2;
-	int stepy1, stepy2;
-	findMax((cudnnType*)C1.u, (cudnnType*)workspace, C1.paras.outSize, &max1);
-	findMax((cudnnType*)C2.u, (cudnnType*)workspace, C2.paras.outSize, &max1);
-	if (max1 > THRESHOLD)
-		stepy1 = max1 / (THRESHOLD + 1) + 1;
-	else
-		stepy1 = 1;
-	if (max2 > THRESHOLD)
-		stepy2 = max2 / (THRESHOLD + 1) + 1;
-	else
-		stepy2 = 1;
-	//对stepy进行调整以保持ratio一致,结果不能太小
-	if (C1.step_w*stepy2 > C2.step_w*stepy1)
-		stepy1 = C1.step_w*stepy2 / C2.step_w;
-	else
-		stepy2 = C2.step_w*stepy1 / C1.step_w;
-	C1.step_y = stepy1;
-	C1.step_y = stepy2;
-
-	//free C1.y and C2.y, compute concat
-	cudaFree(C1.y);
-	cudaFree(C2.y);
-	if (stepy1 > 1)
-		VectorDiv << <GRIDSIZE, BLOCKSIZE >> > ((cudnnType*)C1.u, (cudnnType*)p, stepy1, C1.paras.outSize);
-	else
-		cudaMemcpy(p, C1.u, C1.paras.outSize * sizeof(cudnnType), cudaMemcpyDeviceToDevice);
-	if (stepy2 > 1)
-		VectorDiv << <GRIDSIZE, BLOCKSIZE >> > ((cudnnType*)C2.u, (cudnnType*)p+C1.paras.outSize, stepy2, C2.paras.outSize);
-	else
-		cudaMemcpy((cudnnType*)p+C1.paras.outSize, C2.u, C2.paras.outSize * sizeof(cudnnType), cudaMemcpyDeviceToDevice);
+	cudaDeviceSynchronize();
+	adjustOutput<<<HEIGHT, WIDTH>>>(steps, (convtype*)C4.u, (xwtype*)C4.v, layer);//scale n times
+	//C4.viewmem();
+	cudaDeviceSynchronize();
+	I1.applyRes((xwtype*)C4.v);
 	return 0;
 }
 
@@ -151,12 +136,28 @@ void qvrcnn::insert_y(int stepy, int layer)//layer means current layer
 	steps.stepy[i] = stepy;
 	return;
 }
-
-__global__ void adjustBasic(step_parameters steps, cudnnType*b, cudnnType *b_adj, int n)//scale n times
+qvrcnn::~qvrcnn()
 {
-	int tid = blockIdx.x*blockDim.x + threadIdx.x;
+	cudnnDestroy(cudnnHandle);
+	check(cudaFree(workspace));
+}
+__global__ void adjustBasic(step_parameters steps, btype*b, btype *b_adj, int n)//scale n times
+{
+	long long temp = b[threadIdx.x];
 	int w_num, y_num;
-	long long temp = b[tid] * 255;
+	for (w_num = 0;w_num < n;w_num++)temp *= steps.stepw[w_num];
+	for (y_num = 0;y_num < n;y_num++)
+	{
+		if (temp > 0)
+			temp = (temp + (steps.stepy[y_num] >> 1)) / steps.stepy[y_num];
+		else
+			temp = (temp - (steps.stepy[y_num] >> 1)) / steps.stepy[y_num];
+	}
+	b_adj[threadIdx.x] = temp;
+}
+/*{
+	long long temp = b[threadIdx.x];
+	int w_num, y_num;
 	for (y_num = w_num = 0;y_num < n;y_num++)
 	{
 		while (w_num < n && (temp*steps.stepw[w_num]) / steps.stepw[w_num] == temp)
@@ -165,30 +166,68 @@ __global__ void adjustBasic(step_parameters steps, cudnnType*b, cudnnType *b_adj
 			w_num++;
 		}
 		if (temp > 0)
-			temp = temp / steps.stepy[y_num] + (temp%steps.stepy[y_num] + steps.stepy[y_num] / 2) / steps.stepy[y_num];//avoid overflow
+			temp = (temp + steps.stepy[y_num] >> 1) / steps.stepy[y_num];// + (temp%steps.stepy[y_num] + steps.stepy[y_num] / 2) / steps.stepy[y_num];//avoid overflow
 		else
-			temp = temp / steps.stepy[y_num] + (temp%steps.stepy[y_num] - steps.stepy[y_num] / 2) / steps.stepy[y_num];//avoid overflow
+			temp = (temp - steps.stepy[y_num] >> 1) / steps.stepy[y_num];// + (temp%steps.stepy[y_num] - steps.stepy[y_num] / 2) / steps.stepy[y_num];//avoid overflow
 	}
-	b_adj[tid] = temp;
-}
-__global__ void adjustOutput(step_parameters steps, cudnnType*o, cudnnType *o_adj, int n)//scale n times
+	b_adj[threadIdx.x] = temp;
+}*/
+__global__ void adjustOutput(step_parameters steps, convtype*o, xwtype *o_adj, int n)//scale n times
 {
 	int tid = blockIdx.x*blockDim.x + threadIdx.x;
 	int w_num, y_num;
 	long long temp = o[tid];
-	for (y_num = w_num = 0;w_num < n;w_num++)
-	{
-		while (y_num < n && (temp*steps.stepy[y_num]) / steps.stepy[y_num] == temp)
-		{
-			temp *= steps.stepy[y_num];
-			y_num++;
-		}
-		if (temp > 0)
-			temp = temp / steps.stepw[w_num] + (temp%steps.stepw[w_num] + steps.stepw[w_num] / 2) / steps.stepw[w_num];//avoid overflow
-		else
-			temp = temp / steps.stepw[w_num] + (temp%steps.stepw[w_num] - steps.stepw[w_num] / 2) / steps.stepw[w_num];//avoid overflow
-	}
+	for (y_num = 0;y_num < n - 1;y_num++)temp *= steps.stepy[y_num];
+	if (temp > 0)
+		for (w_num = n - 1;w_num >= 0;w_num--)
+			temp = (temp + (steps.stepw[w_num] >> 1)) / steps.stepw[w_num];
+	else
+		for (w_num = n - 1;w_num >= 0;w_num--)
+			temp = (temp - (steps.stepw[w_num] >> 1)) / steps.stepw[w_num];
 	o_adj[tid] = temp;
+}
+int layer_HWCN2NCHW_VECT_C(FILE* fp_in, FILE* fp_out, int ksize, int inChannel, int outChannel)
+{
+	int wSize = ksize*ksize*inChannel*outChannel, wSize_out;
+	char *w_in = new char[wSize];
+	char *w_out;
+	int *b = new int[outChannel];
+	fread(b, sizeof(int), 1, fp_in);
+	fwrite(b, sizeof(int), 1, fp_out);
+	fread(w_in, sizeof(char), wSize, fp_in);
+	w_out = HWCN2NCHW_VECT_C_CPU(w_in, ksize, ksize, inChannel, outChannel, &wSize_out);
+	fwrite(w_out, sizeof(char), wSize_out, fp_out);
+	fread(b, sizeof(int), outChannel, fp_in);
+	fwrite(b, sizeof(int), outChannel, fp_out);
+	return 0;
+}
+int model_HWCN2NCHW_VECT_C(const char* filein, const char *fileout, int qp)
+{
+	FILE *fp_in, *fp_out;
+	char filename[100];
+	sprintf_s(filename, filein, qp);
+	if (fopen_s(&fp_in, filename, "rb"))
+	{
+		printf("failed to open file %s", filename);
+		exit(1);
+	}
+	sprintf_s(filename, fileout, qp);
+	if (fopen_s(&fp_out, filename, "wb"))
+	{
+		printf("failed to open file %s", filename);
+		exit(1);
+	}
+
+	layer_HWCN2NCHW_VECT_C(fp_in, fp_out, 5, 1, 64);
+	layer_HWCN2NCHW_VECT_C(fp_in, fp_out, 3, 64, 32);
+	layer_HWCN2NCHW_VECT_C(fp_in, fp_out, 5, 64, 16);
+	layer_HWCN2NCHW_VECT_C(fp_in, fp_out, 3, 48, 16);
+	layer_HWCN2NCHW_VECT_C(fp_in, fp_out, 1, 48, 32);
+	layer_HWCN2NCHW_VECT_C(fp_in, fp_out, 5, 48, 1);
+
+	fclose(fp_in);
+	fclose(fp_out);
+	return 0;
 }
 /*
 //init vrcnn

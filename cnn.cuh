@@ -1,7 +1,9 @@
 #include <cudnn.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include "mat.cuh"
+#include "yuv_data.h"
 
 #define check(status) do{									\
 	if(status!=0)											\
@@ -12,43 +14,72 @@
 		}													\
 }while(0)
 
-typedef struct convolution_parameters {
-	int inChannel;
-	int outChannel;
-	int ksize;
-	int height;
-	int width;
-	float alpha = 1;
-	float beta = 0;
-	int outSize;
-	size_t workspaceSize;//workspace size needed
-}CovParas;
 class CovLayer {
 public:
 	CovLayer();
-	int build(cudnnHandle_t cudnnHandle, cudnnTensorDescriptor_t xDesc, int inChannel, int outChannel, int height, int width, int ksize);//build layer
-	size_t buffer_size(void)
-	{
-		return paras.workspaceSize;
-	}
+	int build(cudnnHandle_t cudnnHandle, cudnnTensorDescriptor_t xDesc, int batch, int height, int width, int inChannel, int outChannel, int ksize);//build layer
 	int load_para(FILE *fp);//copy paras from memory to GPU memory
 	int ConvForward(cudnnHandle_t cudnnHandle, cudnnTensorDescriptor_t xDesc, void *x, void *workspace, size_t workspaceSize);//卷积
-	int quantize_out(void *workspace);
-	size_t get_result(void *out);//获取卷积结果
+	int activate(cudnnHandle_t cudnnHandle);
+	int quantize_out(void* workspace);//u(float)->mid(int)->y(char)
+	int viewmem(xwtype*x);
 	int freeMem(void);//free data u and y, typically in reference
 	int setMem(void);//set u and y
-	//~CovLayer();
+	~CovLayer();
 
-	CovParas paras;
+	int batch;
+	int height;
+	int width;
+	int inChannel;
+	int outChannel;
+	int ksize;
+	int wSize, uSize, vSize;
+	size_t workspaceSize;//workspace size needed
+	int max_u;
 	int step_w, step_y;//output quantization parameter
-	cudnnTensorDescriptor_t uDesc, yDesc;//output descriptor
-	void *u, *y;
+	float alpha = 1;
+	float beta = 0;
 	cudnnFilterDescriptor_t wDesc;//权重描述符
 	cudnnTensorDescriptor_t bDesc;//偏置和输出描述符
-	void *w, *b;
-
-private:
+	void *w, *b, *b_adj;
+	cudnnTensorDescriptor_t uDesc, vDesc;//output descriptor
+	void *u, *v;
 	cudnnConvolutionDescriptor_t convDesc;//卷积描述符
-	int algo_num;//number of avaliable algorithms
-	cudnnConvolutionFwdAlgoPerf_t perfResults[8];//卷积算法描述符
+	cudnnActivationDescriptor_t actiDesc;
+	//int algo_num;//number of avaliable algorithms
+	//cudnnConvolutionFwdAlgoPerf_t perfResults[8];//卷积算法描述符
+};
+class ConcatLayer {
+public:
+	ConcatLayer(void);
+	int build(int batch, int height, int width, int inChannel1, int inChannel2);
+	int concat(CovLayer *C1, CovLayer *C2, void *workspace);
+	~ConcatLayer();
+	int batch;
+	int height;
+	int width;
+	int inChannel1;
+	int inChannel2;
+	int outChannel;
+	cudnnTensorDescriptor_t concDesc;
+	void *conc;
+};
+__global__ void HW2HW_VECT_C_PPRO(datatype*x, xwtype*x_ppro);
+class InputLayer {
+public:
+	InputLayer(void);
+	int build(int batch, int channel, int height, int width);
+	int load(datatype *input);
+	int ppro(void);
+	int applyRes(xwtype*res);
+	~InputLayer(void);
+	
+	int batch;
+	int height;
+	int width;
+	int inChannel;
+	int outChannel;
+	int inSize, outSize;
+	cudnnTensorDescriptor_t xDesc;
+	void *x, *x_ppro, *x_rec;
 };

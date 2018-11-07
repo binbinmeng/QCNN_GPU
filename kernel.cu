@@ -1,136 +1,107 @@
 #include <sstream>
+#include <stdlib.h>
+#include <time.h>
 #include "qvrcnn.cuh"
-#include "yuv_data.h"
+//HWCN2NHWC
+#define HWCN_QMODEL "model\\qvrcnn_ppro_hwcn_8bit_%d.data"
+#define NHWC_VECT_QMODEL "model\\qvrcnn_ppro_nhwc_vect_8bit_%d.data"
 
-struct qvrcnn_data {
-	char weight[5*5*64];
-	char bias[64];
-};//实验性，仅读取第一层
-
-struct qvrcnn_data* read_qvrcnn(void)
+void convert_model(void)
 {
-	struct qvrcnn_data* net_data = new struct qvrcnn_data;
-	FILE  *fp = NULL;
-	if (fopen_s(&fp, "model\\qvrcnn_8bit_22.data", "rb"))
-		printf("open file failed\n");
-		fread(net_data->weight, sizeof(char), 5*5*64, fp);
-	fclose(fp);
-	return net_data;
+	model_HWCN2NCHW_VECT_C(HWCN_QMODEL, NHWC_VECT_QMODEL, 22);
+	model_HWCN2NCHW_VECT_C(HWCN_QMODEL, NHWC_VECT_QMODEL, 32);
+	model_HWCN2NCHW_VECT_C(HWCN_QMODEL, NHWC_VECT_QMODEL, 37);
 }
 
-int main(int argc, char** argv)
+void test_layer(char *ori_fn, char *input_fn, char *model_fn, int frame, int height, int width)
 {
-	cublasHandle_t cublasHandle;
-	cudnnHandle_t cudnnHandle;
-	cudnnTensorDescriptor_t dataTensor, conv1Tensor, conv1BiasTensor;//数据和偏置描述符
-	cudnnFilterDescriptor_t conv1filterDesc;//权重描述符
-	cudnnConvolutionDescriptor_t conv1Desc;//卷积描述符
-	//cudnnConvolutionFwdAlgo_t conv1algo;//卷积算法描述符
-	cudnnConvolutionFwdAlgoPerf_t perfResults[8];
-	size_t sizeInBytes;
-
-	YChannel *ydata, *conv1_out;
-	qvrcnn_data* net_data;
-	int batch = 1, channel = 0, height = 240, width = 416, return_value, return_value1;
-	std::stringstream filename;
-	filename << "data\\BlowingBubbles_intra_main_HM16.7_anchor_416x240_10_Q22.yuv";
-	ydata = get_Y(filename.str().c_str(), batch, height, width);
-	conv1_out = get_Y(NULL, 64, height, width);
-
 	int num_gpus;
+	FILE *fp;
+	vrcnn_data test_data(frame, height, width);
+	cudnnHandle_t cudnnHandle;
+	cudnnTensorDescriptor_t xDesc;
+	void *x, *x_h, *workspace;
+	int xSize;
+	
 	cudaGetDeviceCount(&num_gpus);
 	cudaSetDevice(0);
-	cublasCreate(&cublasHandle);
 	cudnnCreate(&cudnnHandle);
-	cudnnCreateTensorDescriptor(&dataTensor);//初始化张量描述符
-	cudnnCreateTensorDescriptor(&conv1Tensor);
-	cudnnCreateTensorDescriptor(&conv1BiasTensor);
+	cudnnCreateTensorDescriptor(&xDesc);
+	if (XWFORMAT == CUDNN_TENSOR_NCHW_VECT_C)
+		cudnnSetTensor4dDescriptor(xDesc, XWFORMAT, XWTYPE, 1, 4, 240, 416);
+	else
+		cudnnSetTensor4dDescriptor(xDesc, XWFORMAT, XWTYPE, 1, 1, 240, 416);
+	CovLayer C1;
+	C1.build(cudnnHandle, xDesc, frame, height, width, 1, 64, 5);
 
-	cudnnCreateFilterDescriptor(&conv1filterDesc);//初始化权重描述符
+	fopen_s(&fp, model_fn, "rb");
+	C1.load_para(fp);
+	//memdbg((convtype*)C1.u, (xwtype*)C1.v, (btype*)C1.b, C1.uSize);
+	fclose(fp);
+	if(C1.workspaceSize>MAXGRID*sizeof(convtype))
+		cudaMalloc(&workspace, C1.workspaceSize);
+	else
+		cudaMalloc(&workspace, MAXGRID*sizeof(convtype));
+	test_data.read_data(ori_fn, input_fn);
+	test_data.preprocess();
 
-	cudnnCreateConvolutionDescriptor(&conv1Desc);//初始化卷积描述符
+	x_h = NCHW2NCHW_VECT_C_CPU(test_data.norm, frame, 1, height, width, &xSize);
+	cudaMalloc(&x, sizeof(restype)*xSize);
+	cudaMemcpy(x, x_h, sizeof(restype)*xSize, cudaMemcpyHostToDevice);
+	free(x_h);
 	
-	//设置卷积描述符
-	return_value = cudnnSetTensor4dDescriptor(conv1BiasTensor,
-		CUDNN_TENSOR_NCHW,
-		CUDNN_DATA_INT32,
-		batch, 64, 1, 1);
+	C1.ConvForward(cudnnHandle, xDesc, x, workspace, C1.workspaceSize);
+	C1.quantize_out(workspace);
+	//C1.viewmem();
+}
+void testqvrcnn(char *ori_fn, char *input_fn, char *model_fn, int frame, int channel, int height, int width)
+{
+	int i, j;
+	int num_gpus;
+	vrcnn_data test_data(frame, height, width);
+	float psnr1, psnr2;
+	clock_t start_t, end_t;
+	double total_t;
 
-	return_value = cudnnSetTensor4dDescriptor(dataTensor,
-		CUDNN_TENSOR_NCHW,
-		CUDNN_DATA_INT32,
-		1, 1, height, width);
-	return_value = cudnnSetFilter4dDescriptor(conv1filterDesc,
-		CUDNN_DATA_INT32,
-		CUDNN_TENSOR_NCHW,
-		64, 1, 5, 5);
-	return_value = cudnnSetConvolution2dDescriptor(conv1Desc,
-		2, 2,
-		1, 1,
-		1, 1,
-		CUDNN_CROSS_CORRELATION,
-		CUDNN_DATA_INT32);
-	return_value = cudnnGetConvolution2dForwardOutputDim(conv1Desc,
-		dataTensor,
-		conv1filterDesc,
-		&batch, &channel, &height, &width);
-	return_value = cudnnSetTensor4dDescriptor(conv1Tensor,
-		CUDNN_TENSOR_NCHW,
-		CUDNN_DATA_INT32,
-		1, 64, height, width);
-	cudnnGetConvolutionForwardAlgorithmMaxCount(cudnnHandle, &return_value);
-	return_value = cudnnGetConvolutionForwardAlgorithm_v7(cudnnHandle,
-		dataTensor,
-		conv1filterDesc,
-		conv1Desc,
-		conv1Tensor,
-		8,
-		&return_value1,
-		perfResults);
-	return_value = cudnnGetConvolutionForwardWorkspaceSize(cudnnHandle,
-		dataTensor,
-		conv1filterDesc,
-		conv1Desc,
-		conv1Tensor,
-		perfResults[0].algo,
-		&sizeInBytes);
+	cudaGetDeviceCount(&num_gpus);
+	qvrcnn qvrcnn1(0, 1, channel, height, width);
+	qvrcnn1.load_para(model_fn);
+	test_data.read_data(ori_fn, input_fn);
+	start_t = clock();
+	for (i = 0;i < frame;i++)
+	{
+		qvrcnn1.load_data(test_data.input + i*channel*height*width);
+		qvrcnn1.forward();
+		cudaDeviceSynchronize();
+		cudaMemcpy(test_data.recon + i*channel*height*width, (datatype*)qvrcnn1.I1.x_rec, channel*height*width, cudaMemcpyDeviceToHost);
+	}
+	end_t = clock();
+	total_t = (double)(end_t - start_t) / CLOCKS_PER_SEC;
+	test_data.psnr_pf();
+	psnr1 = test_data.psnr(test_data.input);
+	psnr2 = test_data.psnr(test_data.recon);
+	printf("\nbefore net:PSNR=%f\nafter quantized net:PSNR=%f\ntime:%f\n", psnr1, psnr2, total_t);
+}
+int run_all()
+{
+	int qp;
 
-	//读取或初始化网络权重
-	net_data = read_qvrcnn();
+	char ori_fn[200];
+	char input_fn[200];
+	char model_fn[200];
 
-	char *d_data;
-	int *d_conv1;//前向传播数据
-	float alpha = 1.0f, beta = 0.0f;
-	return_value = cudaMalloc(&d_data, sizeof(char) *1*416*240);//在GPU中分配空间
-	return_value = cudaMalloc(&d_conv1, sizeof(char) *64*416*240);
-
-	char *d_pconv1, *d_pconv1bias;//网络参数
-	return_value = cudaMalloc(&d_pconv1, sizeof(char) * 5*5*64);
-	return_value = cudaMalloc(&d_pconv1bias, sizeof(char) * 64);
-	
-	void *d_cudnn_workspace = nullptr;//缓存和工作空间
-	if (sizeInBytes > 0)
-		return_value = cudaMalloc(&d_cudnn_workspace, sizeInBytes);//分配工作空间
-
-	return_value = cudaMemcpyAsync(d_pconv1, net_data->weight, sizeof(char) * 5*5*64, cudaMemcpyHostToDevice);//拷贝网络到GPU
-	return_value = cudaDeviceSynchronize();//同步GPU
-	return_value = cudaMemcpyAsync(d_data, ydata->ImgData,
-		sizeof(char) * ydata->frames*ydata->h*ydata->w, cudaMemcpyHostToDevice);//拷贝数据到GPU
-
-	return_value = cudnnConvolutionForward(cudnnHandle, &alpha, dataTensor,
-		d_data, conv1filterDesc, d_pconv1, conv1Desc,
-		perfResults[0].algo, d_cudnn_workspace, sizeInBytes, &beta,
-		conv1Tensor, d_conv1);//进行一次卷积运算
-	return_value = cudaDeviceSynchronize();//同步GPU
-
-	return_value = cudaMemcpy(conv1_out->ImgData, d_conv1, sizeof(char) * 64 * 416 * 240, cudaMemcpyDeviceToHost);
-	//到此步即可完成debug						
-	//cudaMemcpy(&conv1.pconv[0], d_pconv1, sizeof(float) * conv1.pconv.size(), cudaMemcpyDeviceToHost);//从GPU中拷贝出数据
-	return_value = cudaFree(d_data);//释放内存
-	return_value = cudaFree(d_conv1);
-	return_value = cudaFree(d_pconv1);
-	return_value = cudaFree(d_pconv1bias);
-	return_value = cudaFree(d_cudnn_workspace);
-
+	for (qp = 37; qp < 38; qp += 5)
+	{
+		sprintf_s(ori_fn, ORI_FILE);
+		sprintf_s(input_fn, INPUT_FILE, qp);
+		sprintf_s(model_fn, NHWC_VECT_QMODEL, qp);
+		testqvrcnn(ori_fn, input_fn, model_fn, FRAME, CHANNEL, HEIGHT, WIDTH);
+		//testLayer(orifile, input, FRAME, HEIGHT, WIDTH, qp);
+	}
 	return 0;
+}
+int main(void)
+{
+	run_all();
+	//convert_model();
 }
